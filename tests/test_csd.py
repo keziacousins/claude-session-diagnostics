@@ -30,12 +30,29 @@ def _line(
     session_id: str = "sess-1",
     tools: tuple[str, ...] = (),
     cwd: str = "/Users/someone/src/demo",
+    speed: str | None = None,
+    # False writes the old format: only the total of the cache writes, with no
+    # `cache_creation` object to split it by TTL.
+    split: bool = True,
 ) -> str:
     content = [{"type": "text", "text": "..."}]
     content += [
         {"type": "tool_use", "id": f"tu-{i}", "name": name, "input": {}}
         for i, name in enumerate(tools)
     ]
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": write_1h + write_5m,
+        "cache_read_input_tokens": read,
+    }
+    if split:
+        usage["cache_creation"] = {
+            "ephemeral_1h_input_tokens": write_1h,
+            "ephemeral_5m_input_tokens": write_5m,
+        }
+    if speed is not None:
+        usage["speed"] = speed
     return json.dumps(
         {
             "type": "assistant",
@@ -49,16 +66,7 @@ def _line(
                 "id": message_id,
                 "model": model,
                 "content": content,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cache_creation_input_tokens": write_1h + write_5m,
-                    "cache_read_input_tokens": read,
-                    "cache_creation": {
-                        "ephemeral_1h_input_tokens": write_1h,
-                        "ephemeral_5m_input_tokens": write_5m,
-                    },
-                },
+                "usage": usage,
             },
         }
     )
@@ -1349,6 +1357,127 @@ class TestTotals(unittest.TestCase):
             reqs, _ = parser.load(root=root)
             t = analysis.totals(session.build_sessions(reqs))
             self.assertAlmostEqual(t.cache_hit_rate, 0.9)
+
+
+class TestExport(unittest.TestCase):
+    """The measured token quantities in `csd export`, summed over all lanes."""
+
+    def _root(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        _write_transcript(root, "s1", [
+            # A short output at a small context, then a long one at a large context.
+            _line(ts="2026-01-01T10:00:00Z", request_id="r1", message_id="m1",
+                  output_tokens=100, write_1h=10_000),
+            _line(ts="2026-01-01T10:01:00Z", request_id="r2", message_id="m2",
+                  input_tokens=500, output_tokens=1_000, write_5m=4_500, read=95_000,
+                  speed="fast"),
+        ])
+        nested = root / "-Users-someone-src-demo" / "s1" / "subagents"
+        nested.mkdir(parents=True)
+        (nested / "agent-a.jsonl").write_text(
+            _line(ts="2026-01-01T10:00:30Z", request_id="r3", message_id="m3",
+                  output_tokens=50, write_5m=2_000) + "\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _export(self, root: Path) -> list[dict]:
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.main(["--root", str(root), "export"])
+        return json.loads(buf.getvalue())
+
+    def test_context_split_is_summed_over_all_lanes(self):
+        (rec,) = self._export(self._root())
+        self.assertEqual(rec["requests"], 3)
+        self.assertEqual(rec["input_tokens"], 500)
+        self.assertEqual(rec["cache_write_5m"], 4_500 + 2_000)
+        self.assertEqual(rec["cache_write_1h"], 10_000)
+        self.assertEqual(rec["cache_read"], 95_000)
+        self.assertEqual(rec["output_tokens"], 100 + 1_000 + 50)
+
+    def test_context_split_accounts_for_every_prompt_token(self):
+        reqs, _ = parser.load(root=self._root())
+        (s,) = session.build_sessions(reqs)
+        self.assertEqual(
+            s.input_tokens + s.cache_write_5m + s.cache_write_1h + s.cache_read,
+            sum(r.context_tokens for r in s.requests),
+        )
+
+    def test_output_context_product_is_summed_per_request(self):
+        """The product of two averages is not the average of the product."""
+        (rec,) = self._export(self._root())
+        per_request = 100 * 10_000 + 1_000 * 100_000 + 50 * 2_000
+        self.assertEqual(rec["output_context_product"], per_request)
+
+        n = rec["requests"]
+        context = rec["input_tokens"] + rec["cache_write_5m"] \
+            + rec["cache_write_1h"] + rec["cache_read"]
+        from_means = n * (rec["output_tokens"] / n) * (context / n)
+        self.assertNotAlmostEqual(rec["output_context_product"], from_means, places=0)
+
+    def test_output_context_product_excludes_generated_tokens(self):
+        """The context is the prompt the request was sent with, not prompt plus output.
+
+        Two sessions send the same prompts, and the second generates twice the
+        output of the first. If the context excludes the generated tokens, the
+        product doubles exactly. If it included them, the product would more
+        than double, because the output would appear in both factors.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        for name, scale in (("a", 1), ("b", 2)):
+            _write_transcript(root, name, [
+                _line(ts="2026-01-01T10:00:00Z", request_id=f"{name}1",
+                      message_id=f"{name}1", session_id=name,
+                      output_tokens=300 * scale, write_1h=1_000),
+                _line(ts="2026-01-01T10:01:00Z", request_id=f"{name}2",
+                      message_id=f"{name}2", session_id=name,
+                      output_tokens=700 * scale, write_5m=500, read=1_000),
+            ])
+        recs = {r["session_id"]: r for r in self._export(root)}
+        self.assertEqual(
+            recs["b"]["output_context_product"],
+            2 * recs["a"]["output_context_product"],
+        )
+
+    def test_old_transcript_cache_writes_go_to_1h(self):
+        """Old transcripts report only the total of the cache writes.
+
+        The parser gives that total to 1 hour, which is an inferred split. A
+        session can mix the two formats, so the measured split of the new
+        requests must stay as reported.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        _write_transcript(root, "s1", [
+            # Old format: 3,000 written, TTL not reported.
+            _line(ts="2026-01-01T10:00:00Z", request_id="r1", message_id="m1",
+                  write_5m=3_000, split=False),
+            # New format: the split is reported.
+            _line(ts="2026-01-01T10:01:00Z", request_id="r2", message_id="m2",
+                  write_5m=2_000, write_1h=1_000, read=3_000),
+        ])
+        (rec,) = self._export(root)
+        self.assertEqual(rec["cache_write_1h"], 3_000 + 1_000)
+        self.assertEqual(rec["cache_write_5m"], 2_000)
+        self.assertEqual(
+            rec["input_tokens"] + rec["cache_write_5m"]
+            + rec["cache_write_1h"] + rec["cache_read"],
+            3_000 + 3_000 + 3_000,
+        )
+
+    def test_fast_output_tokens_counts_only_fast_requests(self):
+        (rec,) = self._export(self._root())
+        self.assertEqual(rec["fast_output_tokens"], 1_000)
+        self.assertEqual(rec["output_tokens"], 100 + 1_000 + 50)
 
 
 class TestWarmLanes(unittest.TestCase):
